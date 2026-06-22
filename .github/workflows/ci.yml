@@ -1,0 +1,56 @@
+name: CI
+
+# Runs whenever you push to a feature branch, and again on the PR itself
+# once you open it against staging — that second run is the one that gates the merge.
+on:
+  push:
+    branches:
+      - 'feature/**'
+  pull_request:
+    branches:
+      - staging
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint --if-present
+
+      - name: Build Vite app
+        run: npm run build
+
+      - name: Build Docker image
+        run: docker build -t pong-app:ci .
+
+      - name: Run container and smoke test
+        run: |
+          docker run -d --name pong-test -p 8080:80 pong-app:ci
+          # give nginx a moment to start
+          for i in {1..10}; do
+            if curl -sf http://localhost:8080 > /dev/null; then
+              echo "Container responded successfully"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Container did not respond in time"
+          docker logs pong-test
+          exit 1
+
+      - name: Clean up container
+        if: always()
+        run: docker rm -f pong-test || true
