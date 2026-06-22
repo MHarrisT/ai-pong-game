@@ -1,0 +1,28 @@
+name: Deploy to Vercel
+
+# Fires once a PR is merged into staging. Point this at `main` too
+# (or add a second job with --prod) once you're ready to wire up production.
+on:
+  push:
+    branches:
+      - staging
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      - name: Pull Vercel project settings
+        run: vercel pull --yes --environment=preview --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Build project for Vercel
+        run: vercel build --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Deploy prebuilt output
+        run: vercel deploy --prebuilt --token=${{ secrets.VERCEL_TOKEN }}
