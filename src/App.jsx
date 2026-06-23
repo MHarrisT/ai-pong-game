@@ -8,6 +8,7 @@ const PADDLE_HEIGHT = 100;
 const BALL_SIZE = 10;
 const PADDLE_SPEED = 6;
 const BROADCAST_INTERVAL_MS = 1000 / 30; // 30fps
+const WIN_SCORE = 11;
 
 // --- Room resolution: generate, or read from ?room=ABCD ---
 function resolveRoom() {
@@ -44,11 +45,17 @@ function serveBall(s, scoringSide) {
   s.serveAt = performance.now() + 1000;
 }
 
-// Hitting near the paddle's edge adds more vertical kick than
-// hitting dead center.
 function bounceAngle(ballY, paddleY) {
   const relativeIntersect = (ballY - paddleY) / PADDLE_HEIGHT - 0.5;
   return relativeIntersect * 4;
+}
+
+// Resets score + ball, clears game-over state, serves fresh.
+// Only ever called on the host (directly, or via a restart request).
+function resetGame(s) {
+  s.score = { p1: 0, p2: 0 };
+  s.gameOver = null;
+  serveBall(s, Math.random() < 0.5 ? 'p1' : 'p2');
 }
 
 function makeInitialState() {
@@ -60,6 +67,7 @@ function makeInitialState() {
     score: { p1: 0, p2: 0 },
     serving: false,
     serveAt: 0,
+    gameOver: null, // null | 'p1' | 'p2'
     remote: {
       paddle: {
         prevY: CANVAS_HEIGHT / 2 - PADDLE_HEIGHT / 2,
@@ -74,48 +82,19 @@ function makeInitialState() {
     },
   };
 }
-function draw(ctx, s, isHost, renderOpponentPaddleY) {
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-
-  const leftPaddleY = isHost ? s.myPaddleY : renderOpponentPaddleY;
-  const rightPaddleY = isHost ? renderOpponentPaddleY : s.myPaddleY;
-
-  ctx.fillStyle = '#fff';
-  ctx.fillRect(20, leftPaddleY, PADDLE_WIDTH, PADDLE_HEIGHT);
-  ctx.fillRect(CANVAS_WIDTH - 20 - PADDLE_WIDTH, rightPaddleY, PADDLE_WIDTH, PADDLE_HEIGHT);
-
-  ctx.font = '28px sans-serif';
-  ctx.textAlign = 'center';
-  ctx.fillText(`${s.score.p1}   ${s.score.p2}`, CANVAS_WIDTH / 2, 40);
-
-  if (!s.bothConnected) {
-    ctx.font = '20px sans-serif';
-    ctx.fillStyle = '#888';
-    ctx.fillText('Waiting for opponent…', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
-    return;
-  }
-
-  if (s.serving) {
-    ctx.font = '20px sans-serif';
-    ctx.fillStyle = '#888';
-    ctx.fillText('Get ready…', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 30);
-  }
-
-  ctx.fillStyle = '#fff';
-  ctx.fillRect(s.ball.x, s.ball.y, BALL_SIZE, BALL_SIZE);
-}
 
 export default function App() {
   const canvasRef = useRef(null);
   const channelRef = useRef(null);
   const rafRef = useRef(null);
   const lastBroadcastRef = useRef(0);
+  const lastWinnerRef = useRef(null); // tracks last value pushed to React state
   const keysRef = useRef({ up: false, down: false });
   const stateRef = useRef(makeInitialState());
 
   const [{ roomCode, isHost }] = useState(resolveRoom);
   const [status, setStatus] = useState('connecting'); // connecting | waiting | connected
+  const [winner, setWinner] = useState(null); // null | 'p1' | 'p2' — mirrors stateRef.gameOver for rendering
 
   // --- Join channel + presence ---
   useEffect(() => {
@@ -142,6 +121,7 @@ export default function App() {
 
       s.score = payload.score;
       s.serving = payload.serving;
+      s.gameOver = payload.gameOver;
     });
 
     channel.on('broadcast', { event: 'p2_state' }, ({ payload }) => {
@@ -155,6 +135,12 @@ export default function App() {
       s.remote.paddle.receivedAt = now;
     });
 
+    // Either player can request a restart; only the host actually
+    // performs it (host is the single source of truth for score/state).
+    channel.on('broadcast', { event: 'restart_request' }, () => {
+      if (isHost) resetGame(stateRef.current);
+    });
+
     channel.on('presence', { event: 'sync' }, () => {
       const peers = Object.keys(channel.presenceState());
       const ready = peers.includes('p1') && peers.includes('p2');
@@ -165,8 +151,7 @@ export default function App() {
       setStatus(ready ? 'connected' : 'waiting');
 
       if (ready && !wasReady && isHost) {
-        s.score = { p1: 0, p2: 0 };
-        serveBall(s, Math.random() < 0.5 ? 'p1' : 'p2');
+        resetGame(s);
       }
     });
 
@@ -209,13 +194,13 @@ export default function App() {
     const loop = (timestamp) => {
       const s = stateRef.current;
 
-      // Move my own paddle
+      // Move my own paddle (allowed even after game over, just for fun — harmless)
       if (keysRef.current.up) s.myPaddleY = Math.max(0, s.myPaddleY - PADDLE_SPEED);
       if (keysRef.current.down)
         s.myPaddleY = Math.min(CANVAS_HEIGHT - PADDLE_HEIGHT, s.myPaddleY + PADDLE_SPEED);
 
-      // Host-authoritative physics
-      if (isHost && s.bothConnected) {
+      // Host-authoritative physics — frozen once gameOver is set
+      if (isHost && s.bothConnected && !s.gameOver) {
         if (s.serving) {
           if (performance.now() >= s.serveAt) s.serving = false;
         } else {
@@ -253,14 +238,30 @@ export default function App() {
             ball.vy += bounceAngle(ball.y, s.opponentPaddleY);
           }
 
+          // Scoring + win check
           if (ball.x < 0) {
             s.score.p2 += 1;
-            serveBall(s, 'p2');
+            if (s.score.p2 >= WIN_SCORE) {
+              s.gameOver = 'p2';
+            } else {
+              serveBall(s, 'p2');
+            }
           } else if (ball.x > CANVAS_WIDTH - BALL_SIZE) {
             s.score.p1 += 1;
-            serveBall(s, 'p1');
+            if (s.score.p1 >= WIN_SCORE) {
+              s.gameOver = 'p1';
+            } else {
+              serveBall(s, 'p1');
+            }
           }
         }
+      }
+
+      // Push gameOver into React state only when it actually changes,
+      // so we re-render the overlay without re-rendering every frame.
+      if (s.gameOver !== lastWinnerRef.current) {
+        lastWinnerRef.current = s.gameOver;
+        setWinner(s.gameOver);
       }
 
       // Interpolate opponent paddle for smooth rendering
@@ -299,6 +300,7 @@ export default function App() {
                 ball: s.ball,
                 score: s.score,
                 serving: s.serving,
+                gameOver: s.gameOver,
               },
             });
           } else {
@@ -319,6 +321,49 @@ export default function App() {
     return () => cancelAnimationFrame(rafRef.current);
   }, [isHost]);
 
+  function draw(ctx, s, isHost, renderOpponentPaddleY) {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+    const leftPaddleY = isHost ? s.myPaddleY : renderOpponentPaddleY;
+    const rightPaddleY = isHost ? renderOpponentPaddleY : s.myPaddleY;
+
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(20, leftPaddleY, PADDLE_WIDTH, PADDLE_HEIGHT);
+    ctx.fillRect(CANVAS_WIDTH - 20 - PADDLE_WIDTH, rightPaddleY, PADDLE_WIDTH, PADDLE_HEIGHT);
+
+    ctx.font = '28px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${s.score.p1}   ${s.score.p2}`, CANVAS_WIDTH / 2, 40);
+
+    if (!s.bothConnected) {
+      ctx.font = '20px sans-serif';
+      ctx.fillStyle = '#888';
+      ctx.fillText('Waiting for opponent…', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
+      return;
+    }
+
+    if (s.serving && !s.gameOver) {
+      ctx.font = '20px sans-serif';
+      ctx.fillStyle = '#888';
+      ctx.fillText('Get ready…', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 30);
+    }
+
+    if (!s.gameOver) {
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(s.ball.x, s.ball.y, BALL_SIZE, BALL_SIZE);
+    }
+  }
+
+  function handleRestart() {
+    if (isHost) {
+      resetGame(stateRef.current);
+    } else {
+      channelRef.current?.send({ type: 'broadcast', event: 'restart_request', payload: {} });
+    }
+  }
+
+  const youWon = winner && ((winner === 'p1' && isHost) || (winner === 'p2' && !isHost));
 
   return (
     <div style={{ textAlign: 'center', color: '#fff' }}>
@@ -329,12 +374,54 @@ export default function App() {
       {status === 'waiting' && isHost && (
         <p>Share this link: {window.location.href}</p>
       )}
-      <canvas
-        ref={canvasRef}
-        width={CANVAS_WIDTH}
-        height={CANVAS_HEIGHT}
-        style={{ background: '#000', border: '1px solid #444' }}
-      />
+
+      <div style={{ position: 'relative', display: 'inline-block' }}>
+        <canvas
+          ref={canvasRef}
+          width={CANVAS_WIDTH}
+          height={CANVAS_HEIGHT}
+          style={{ background: '#000', border: '1px solid #444' }}
+        />
+
+        {winner && (
+          <div
+            style={{
+              position: 'absolute',
+              top: 0,
+              left: 0,
+              width: '100%',
+              height: '100%',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              justifyContent: 'center',
+              background: 'rgba(0, 0, 0, 0.75)',
+              gap: '16px',
+            }}
+          >
+            <h2 style={{ margin: 0, fontSize: '32px' }}>
+              {youWon ? 'You Win! 🎉' : 'You Lose'}
+            </h2>
+            <p style={{ margin: 0, opacity: 0.8 }}>
+              {winner === 'p1' ? 'Player 1' : 'Player 2'} reached {WIN_SCORE} points
+            </p>
+            <button
+              onClick={handleRestart}
+              style={{
+                padding: '10px 24px',
+                fontSize: '16px',
+                cursor: 'pointer',
+                background: '#fff',
+                color: '#000',
+                border: 'none',
+                borderRadius: '6px',
+              }}
+            >
+              Restart Game
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
