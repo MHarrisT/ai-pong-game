@@ -64,6 +64,7 @@ function makeInitialState() {
     opponentPaddleY: CANVAS_HEIGHT / 2 - PADDLE_HEIGHT / 2,
     ball: { x: CANVAS_WIDTH / 2, y: CANVAS_HEIGHT / 2, vx: 4, vy: 3 },
     bothConnected: false,
+    matchRowId: null,
     score: { p1: 0, p2: 0 },
     serving: false,
     serveAt: 0,
@@ -184,9 +185,22 @@ export default function App() {
       s.bothConnected = ready;
       setStatus(ready ? 'connected' : 'waiting');
 
-      if (ready && !wasReady && isHost) {
-        resetGame(s);
-      }
+        if (ready && !wasReady && isHost) {
+          resetGame(s);
+
+          supabase
+            .from('game_sessions')
+            .insert({ player_1_ready: true, player_2_ready: true, score_1: 0, score_2: 0 })
+            .select('id')
+            .single()
+            .then(({ data, error }) => {
+              if (error) {
+                console.error('Failed to create game session:', error);
+              } else {
+                s.matchRowId = data.id;
+              }
+            });
+        }
     });
 
     channel.subscribe((subStatus) => {
@@ -296,6 +310,16 @@ export default function App() {
       if (s.gameOver !== lastWinnerRef.current) {
         lastWinnerRef.current = s.gameOver;
         setWinner(s.gameOver);
+
+        if (s.gameOver && isHost && s.matchRowId) {
+          supabase
+            .from('game_sessions')
+            .update({ score_1: s.score.p1, score_2: s.score.p2 })
+            .eq('id', s.matchRowId)
+            .then(({ error }) => {
+              if (error) console.error('Failed to save final score:', error);
+            });
+        }
       }
 
       // Interpolate opponent paddle for smooth rendering
