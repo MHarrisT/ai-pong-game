@@ -83,6 +83,40 @@ function makeInitialState() {
   };
 }
 
+  function draw(ctx, s, isHost, renderOpponentPaddleY) {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+
+    const leftPaddleY = isHost ? s.myPaddleY : renderOpponentPaddleY;
+    const rightPaddleY = isHost ? renderOpponentPaddleY : s.myPaddleY;
+
+    ctx.fillStyle = '#fff';
+    ctx.fillRect(20, leftPaddleY, PADDLE_WIDTH, PADDLE_HEIGHT);
+    ctx.fillRect(CANVAS_WIDTH - 20 - PADDLE_WIDTH, rightPaddleY, PADDLE_WIDTH, PADDLE_HEIGHT);
+
+    ctx.font = '28px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText(`${s.score.p1}   ${s.score.p2}`, CANVAS_WIDTH / 2, 40);
+
+    if (!s.bothConnected) {
+      ctx.font = '20px sans-serif';
+      ctx.fillStyle = '#888';
+      ctx.fillText('Waiting for opponent…', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
+      return;
+    }
+
+    if (s.serving && !s.gameOver) {
+      ctx.font = '20px sans-serif';
+      ctx.fillStyle = '#888';
+      ctx.fillText('Get ready…', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 30);
+    }
+
+    if (!s.gameOver) {
+      ctx.fillStyle = '#fff';
+      ctx.fillRect(s.ball.x, s.ball.y, BALL_SIZE, BALL_SIZE);
+    }
+  }
+
 export default function App() {
   const canvasRef = useRef(null);
   const channelRef = useRef(null);
@@ -321,39 +355,6 @@ export default function App() {
     return () => cancelAnimationFrame(rafRef.current);
   }, [isHost]);
 
-  function draw(ctx, s, isHost, renderOpponentPaddleY) {
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
-
-    const leftPaddleY = isHost ? s.myPaddleY : renderOpponentPaddleY;
-    const rightPaddleY = isHost ? renderOpponentPaddleY : s.myPaddleY;
-
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(20, leftPaddleY, PADDLE_WIDTH, PADDLE_HEIGHT);
-    ctx.fillRect(CANVAS_WIDTH - 20 - PADDLE_WIDTH, rightPaddleY, PADDLE_WIDTH, PADDLE_HEIGHT);
-
-    ctx.font = '28px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(`${s.score.p1}   ${s.score.p2}`, CANVAS_WIDTH / 2, 40);
-
-    if (!s.bothConnected) {
-      ctx.font = '20px sans-serif';
-      ctx.fillStyle = '#888';
-      ctx.fillText('Waiting for opponent…', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
-      return;
-    }
-
-    if (s.serving && !s.gameOver) {
-      ctx.font = '20px sans-serif';
-      ctx.fillStyle = '#888';
-      ctx.fillText('Get ready…', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 30);
-    }
-
-    if (!s.gameOver) {
-      ctx.fillStyle = '#fff';
-      ctx.fillRect(s.ball.x, s.ball.y, BALL_SIZE, BALL_SIZE);
-    }
-  }
 
   function handleRestart() {
     if (isHost) {
