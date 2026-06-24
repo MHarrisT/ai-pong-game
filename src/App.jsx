@@ -7,22 +7,19 @@ const PADDLE_WIDTH = 12;
 const PADDLE_HEIGHT = 100;
 const BALL_SIZE = 10;
 const PADDLE_SPEED = 6;
-const BROADCAST_INTERVAL_MS = 1000 / 30; // 30fps
+const BROADCAST_INTERVAL_MS = 1000 / 60;
 const WIN_SCORE = 11;
+const MS_PER_HOST_TICK = 16.67; // approx host frame time, for velocity scaling
+const GLOW_PAD = 24; // extra canvas margin so the blur isn't clipped
 
-// --- Room resolution: generate, or read from ?room=ABCD ---
 function resolveRoom() {
   const params = new URLSearchParams(window.location.search);
   const existing = params.get('room');
-
-  if (existing) {
-    return { roomCode: existing.toUpperCase(), isHost: false };
-  }
+  if (existing) return { roomCode: existing.toUpperCase(), isHost: false };
 
   const code = Array.from({ length: 4 }, () =>
     'ABCDEFGHIJKLMNOPQRSTUVWXYZ'[Math.floor(Math.random() * 26)]
   ).join('');
-
   params.set('room', code);
   window.history.replaceState({}, '', `${window.location.pathname}?${params}`);
   return { roomCode: code, isHost: true };
@@ -32,8 +29,10 @@ function lerp(a, b, t) {
   return a + (b - a) * t;
 }
 
-// scoringSide = who just won the point. Ball serves toward the
-// side that just lost, giving them the next touch.
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
+}
+
 function serveBall(s, scoringSide) {
   s.ball.x = CANVAS_WIDTH / 2 - BALL_SIZE / 2;
   s.ball.y = CANVAS_HEIGHT / 2 - BALL_SIZE / 2;
@@ -50,8 +49,6 @@ function bounceAngle(ballY, paddleY) {
   return relativeIntersect * 4;
 }
 
-// Resets score + ball, clears game-over state, serves fresh.
-// Only ever called on the host (directly, or via a restart request).
 function resetGame(s) {
   s.score = { p1: 0, p2: 0 };
   s.gameOver = null;
@@ -64,74 +61,97 @@ function makeInitialState() {
     opponentPaddleY: CANVAS_HEIGHT / 2 - PADDLE_HEIGHT / 2,
     ball: { x: CANVAS_WIDTH / 2, y: CANVAS_HEIGHT / 2, vx: 4, vy: 3 },
     bothConnected: false,
-    matchRowId: null,
     score: { p1: 0, p2: 0 },
     serving: false,
     serveAt: 0,
-    gameOver: null, // null | 'p1' | 'p2'
+    gameOver: null,
+    matchRowId: null,
     remote: {
       paddle: {
         prevY: CANVAS_HEIGHT / 2 - PADDLE_HEIGHT / 2,
         targetY: CANVAS_HEIGHT / 2 - PADDLE_HEIGHT / 2,
         receivedAt: 0,
+        interval: BROADCAST_INTERVAL_MS,
       },
       ball: {
         prev: { x: CANVAS_WIDTH / 2, y: CANVAS_HEIGHT / 2 },
-        target: { x: CANVAS_WIDTH / 2, y: CANVAS_HEIGHT / 2 },
+        target: { x: CANVAS_WIDTH / 2, y: CANVAS_HEIGHT / 2, vx: 0, vy: 0 },
+        renderX: CANVAS_WIDTH / 2,   
+        renderY: CANVAS_HEIGHT / 2,
         receivedAt: 0,
+        interval: BROADCAST_INTERVAL_MS,
       },
     },
   };
 }
 
-  function draw(ctx, s, isHost, renderOpponentPaddleY) {
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
+function draw(ctx, s, isHost, renderOpponentPaddleY, ballSprite, paddleSprite) {
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+  ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-    const leftPaddleY = isHost ? s.myPaddleY : renderOpponentPaddleY;
-    const rightPaddleY = isHost ? renderOpponentPaddleY : s.myPaddleY;
+  const leftPaddleY = isHost ? s.myPaddleY : renderOpponentPaddleY;
+  const rightPaddleY = isHost ? renderOpponentPaddleY : s.myPaddleY;
 
-    ctx.fillStyle = '#fff';
-    ctx.fillRect(20, leftPaddleY, PADDLE_WIDTH, PADDLE_HEIGHT);
-    ctx.fillRect(CANVAS_WIDTH - 20 - PADDLE_WIDTH, rightPaddleY, PADDLE_WIDTH, PADDLE_HEIGHT);
-
-    ctx.font = '28px sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText(`${s.score.p1}   ${s.score.p2}`, CANVAS_WIDTH / 2, 40);
-
-    if (!s.bothConnected) {
-      ctx.font = '20px sans-serif';
-      ctx.fillStyle = '#888';
-      ctx.fillText('Waiting for opponent…', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
-      return;
-    }
-
-    if (s.serving && !s.gameOver) {
-      ctx.font = '20px sans-serif';
-      ctx.fillStyle = '#888';
-      ctx.fillText('Get ready…', CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2 - 30);
-    }
-
-    if (!s.gameOver) {
-      ctx.fillStyle = '#fff';
-      ctx.fillRect(s.ball.x, s.ball.y, BALL_SIZE, BALL_SIZE);
-    }
+  if (paddleSprite) {
+    ctx.drawImage(paddleSprite, 20 - GLOW_PAD, leftPaddleY - GLOW_PAD);
+    ctx.drawImage(
+      paddleSprite,
+      CANVAS_WIDTH - 20 - PADDLE_WIDTH - GLOW_PAD,
+      rightPaddleY - GLOW_PAD
+    );
   }
+
+  if (s.bothConnected && !s.gameOver && ballSprite) {
+    ctx.drawImage(ballSprite, s.ball.x - GLOW_PAD, s.ball.y - GLOW_PAD);
+  }
+}
 
 export default function App() {
   const canvasRef = useRef(null);
   const channelRef = useRef(null);
+  const channelReadyRef = useRef(false);
   const rafRef = useRef(null);
   const lastBroadcastRef = useRef(0);
-  const lastWinnerRef = useRef(null); // tracks last value pushed to React state
+  const lastWinnerRef = useRef(null);
   const keysRef = useRef({ up: false, down: false });
   const stateRef = useRef(makeInitialState());
+  const scoreRef = useRef(null);
+  const statusOverlayRef = useRef(null);
+  const ballSpriteRef = useRef(null);
+  const paddleSpriteRef = useRef(null);
+  const lastPaddleSentRef = useRef(
+  CANVAS_HEIGHT / 2 - PADDLE_HEIGHT / 2
+);
 
   const [{ roomCode, isHost }] = useState(resolveRoom);
-  const [status, setStatus] = useState('connecting'); // connecting | waiting | connected
-  const [winner, setWinner] = useState(null); // null | 'p1' | 'p2' — mirrors stateRef.gameOver for rendering
+  const [status, setStatus] = useState('connecting');
+  const [winner, setWinner] = useState(null);
 
-  // --- Join channel + presence ---
+  // ✅ FIXED: Sprite Generation extracted to the top level
+  useEffect(() => {
+    // Ball sprite
+    const ballCanvas = document.createElement('canvas');
+    ballCanvas.width = BALL_SIZE + GLOW_PAD * 2;
+    ballCanvas.height = BALL_SIZE + GLOW_PAD * 2;
+    const bctx = ballCanvas.getContext('2d');
+    bctx.shadowColor = '#0ff';
+    bctx.shadowBlur = 20;
+    bctx.fillStyle = '#fff';
+    bctx.fillRect(GLOW_PAD, GLOW_PAD, BALL_SIZE, BALL_SIZE);
+    ballSpriteRef.current = ballCanvas;
+
+    // Paddle sprite
+    const paddleCanvas = document.createElement('canvas');
+    paddleCanvas.width = PADDLE_WIDTH + GLOW_PAD * 2;
+    paddleCanvas.height = PADDLE_HEIGHT + GLOW_PAD * 2;
+    const pctx = paddleCanvas.getContext('2d');
+    pctx.shadowColor = '#0ff';
+    pctx.shadowBlur = 20;
+    pctx.fillStyle = '#fff';
+    pctx.fillRect(GLOW_PAD, GLOW_PAD, PADDLE_WIDTH, PADDLE_HEIGHT);
+    paddleSpriteRef.current = paddleCanvas;
+  }, []);
+
   useEffect(() => {
     const channel = supabase.channel(`room_${roomCode}`, {
       config: {
@@ -145,13 +165,20 @@ export default function App() {
       const s = stateRef.current;
       const now = performance.now();
 
-      s.opponentPaddleY = payload.paddleY;
+      const paddleGap = s.remote.paddle.receivedAt
+        ? now - s.remote.paddle.receivedAt
+        : BROADCAST_INTERVAL_MS;
+      s.remote.paddle.interval = clamp(paddleGap, 16, 200);
       s.remote.paddle.prevY = s.remote.paddle.targetY;
       s.remote.paddle.targetY = payload.paddleY;
       s.remote.paddle.receivedAt = now;
 
-      s.remote.ball.prev = s.remote.ball.target;
-      s.remote.ball.target = payload.ball;
+      const ballGap = s.remote.ball.receivedAt
+        ? now - s.remote.ball.receivedAt
+        : BROADCAST_INTERVAL_MS;
+      s.remote.ball.interval = clamp(ballGap, 16, 200);
+      s.remote.ball.prev = { ...s.remote.ball.target };
+      s.remote.ball.target = { ...payload.ball };
       s.remote.ball.receivedAt = now;
 
       s.score = payload.score;
@@ -164,14 +191,16 @@ export default function App() {
       const s = stateRef.current;
       const now = performance.now();
 
+      const paddleGap = s.remote.paddle.receivedAt
+        ? now - s.remote.paddle.receivedAt
+        : BROADCAST_INTERVAL_MS;
+      s.remote.paddle.interval = clamp(paddleGap, 16, 200);
       s.opponentPaddleY = payload.paddleY;
       s.remote.paddle.prevY = s.remote.paddle.targetY;
       s.remote.paddle.targetY = payload.paddleY;
       s.remote.paddle.receivedAt = now;
     });
 
-    // Either player can request a restart; only the host actually
-    // performs it (host is the single source of truth for score/state).
     channel.on('broadcast', { event: 'restart_request' }, () => {
       if (isHost) resetGame(stateRef.current);
     });
@@ -185,26 +214,23 @@ export default function App() {
       s.bothConnected = ready;
       setStatus(ready ? 'connected' : 'waiting');
 
-        if (ready && !wasReady && isHost) {
-          resetGame(s);
-
-          supabase
-            .from('game_sessions')
-            .insert({ player_1_ready: true, player_2_ready: true, score_1: 0, score_2: 0 })
-            .select('id')
-            .single()
-            .then(({ data, error }) => {
-              if (error) {
-                console.error('Failed to create game session:', error);
-              } else {
-                s.matchRowId = data.id;
-              }
-            });
-        }
+      if (ready && !wasReady && isHost) {
+        resetGame(s);
+        supabase
+          .from('game_sessions')
+          .insert({ player_1_ready: true, player_2_ready: true, score_1: 0, score_2: 0 })
+          .select('id')
+          .single()
+          .then(({ data, error }) => {
+            if (error) console.error('Failed to create game session:', error);
+            else s.matchRowId = data.id;
+          });
+      }
     });
 
     channel.subscribe((subStatus) => {
       if (subStatus === 'SUBSCRIBED') {
+        channelReadyRef.current = true;
         channel.track({ online: true });
       }
     });
@@ -212,11 +238,11 @@ export default function App() {
     channelRef.current = channel;
 
     return () => {
+      channelReadyRef.current = false;
       supabase.removeChannel(channel);
     };
   }, [roomCode, isHost]);
 
-  // --- Keyboard input ---
   useEffect(() => {
     const onKeyDown = (e) => {
       if (e.key === 'ArrowUp') keysRef.current.up = true;
@@ -234,7 +260,6 @@ export default function App() {
     };
   }, []);
 
-  // --- Game loop ---
   useEffect(() => {
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
@@ -242,12 +267,10 @@ export default function App() {
     const loop = (timestamp) => {
       const s = stateRef.current;
 
-      // Move my own paddle (allowed even after game over, just for fun — harmless)
       if (keysRef.current.up) s.myPaddleY = Math.max(0, s.myPaddleY - PADDLE_SPEED);
       if (keysRef.current.down)
         s.myPaddleY = Math.min(CANVAS_HEIGHT - PADDLE_HEIGHT, s.myPaddleY + PADDLE_SPEED);
 
-      // Host-authoritative physics — frozen once gameOver is set
       if (isHost && s.bothConnected && !s.gameOver) {
         if (s.serving) {
           if (performance.now() >= s.serveAt) s.serving = false;
@@ -258,7 +281,6 @@ export default function App() {
 
           if (ball.y <= 0 || ball.y >= CANVAS_HEIGHT - BALL_SIZE) ball.vy *= -1;
 
-          // Left paddle (host / P1)
           const leftPaddleX = 20;
           if (
             ball.vx < 0 &&
@@ -270,9 +292,9 @@ export default function App() {
             ball.x = leftPaddleX + PADDLE_WIDTH;
             ball.vx *= -1.05;
             ball.vy += bounceAngle(ball.y, s.myPaddleY);
+            ball.vy = clamp(ball.vy, -12, 12);
           }
 
-          // Right paddle (opponent / P2)
           const rightPaddleX = CANVAS_WIDTH - 20 - PADDLE_WIDTH;
           if (
             ball.vx > 0 &&
@@ -284,29 +306,21 @@ export default function App() {
             ball.x = rightPaddleX - BALL_SIZE;
             ball.vx *= -1.05;
             ball.vy += bounceAngle(ball.y, s.opponentPaddleY);
+            ball.vy = clamp(ball.vy, -12, 12);
           }
 
-          // Scoring + win check
           if (ball.x < 0) {
             s.score.p2 += 1;
-            if (s.score.p2 >= WIN_SCORE) {
-              s.gameOver = 'p2';
-            } else {
-              serveBall(s, 'p2');
-            }
+            if (s.score.p2 >= WIN_SCORE) s.gameOver = 'p2';
+            else serveBall(s, 'p2');
           } else if (ball.x > CANVAS_WIDTH - BALL_SIZE) {
             s.score.p1 += 1;
-            if (s.score.p1 >= WIN_SCORE) {
-              s.gameOver = 'p1';
-            } else {
-              serveBall(s, 'p1');
-            }
+            if (s.score.p1 >= WIN_SCORE) s.gameOver = 'p1';
+            else serveBall(s, 'p1');
           }
         }
       }
 
-      // Push gameOver into React state only when it actually changes,
-      // so we re-render the overlay without re-rendering every frame.
       if (s.gameOver !== lastWinnerRef.current) {
         lastWinnerRef.current = s.gameOver;
         setWinner(s.gameOver);
@@ -322,33 +336,50 @@ export default function App() {
         }
       }
 
-      // Interpolate opponent paddle for smooth rendering
-      const remote = s.remote;
-      const paddleT = Math.min(
-        (performance.now() - remote.paddle.receivedAt) / BROADCAST_INTERVAL_MS,
-        1
-      );
-      const renderOpponentPaddleY = lerp(remote.paddle.prevY, remote.paddle.targetY, paddleT);
+      let renderOpponentPaddleY = s.opponentPaddleY;
 
-      // Player 2 interpolates the ball too (host's ball is already authoritative)
       if (!isHost) {
-        const ballT = Math.min(
-          (performance.now() - remote.ball.receivedAt) / BROADCAST_INTERVAL_MS,
-          1
+        const now = performance.now();
+        const remote = s.remote;
+
+        const paddleElapsed = now - remote.paddle.receivedAt;
+        const paddleDuration = remote.paddle.interval;
+        const paddleT = clamp(paddleElapsed / paddleDuration, 0, 1);
+        const paddleRate = (remote.paddle.targetY - remote.paddle.prevY) / paddleDuration;
+        const paddleOvershoot = Math.max(paddleElapsed - paddleDuration, 0);
+
+        renderOpponentPaddleY = clamp(
+          lerp(remote.paddle.prevY, remote.paddle.targetY, paddleT) +
+            paddleRate * Math.min(paddleOvershoot, 80), 
+          0,
+          CANVAS_HEIGHT - PADDLE_HEIGHT
         );
+
+        const dt = Math.min(now - remote.ball.receivedAt, 150); // cap extrapolation if a packet is late/dropped
+
+        const predictedX =
+          remote.ball.target.x +
+          remote.ball.target.vx * (dt / MS_PER_HOST_TICK);
+
+        const predictedY =
+          remote.ball.target.y +
+          remote.ball.target.vy * (dt / MS_PER_HOST_TICK);
+
+        remote.ball.renderX += (predictedX - remote.ball.renderX) * 0.20;
+        remote.ball.renderY += (predictedY - remote.ball.renderY) * 0.20;
+
         s.ball = {
-          x: lerp(remote.ball.prev.x, remote.ball.target.x, ballT),
-          y: lerp(remote.ball.prev.y, remote.ball.target.y, ballT),
+          x: remote.ball.renderX,
+          y: remote.ball.renderY,
           vx: remote.ball.target.vx,
           vy: remote.ball.target.vy,
         };
       }
 
-      // Throttled broadcast at 30fps
       if (timestamp - lastBroadcastRef.current >= BROADCAST_INTERVAL_MS) {
         lastBroadcastRef.current = timestamp;
         const channel = channelRef.current;
-        if (channel) {
+        if (channel && channelReadyRef.current) {
           if (isHost) {
             channel.send({
               type: 'broadcast',
@@ -362,23 +393,37 @@ export default function App() {
               },
             });
           } else {
-            channel.send({
-              type: 'broadcast',
-              event: 'p2_state',
-              payload: { paddleY: s.myPaddleY },
-            });
+            if (
+              Math.abs(s.myPaddleY - lastPaddleSentRef.current) > 1
+            ) {
+              lastPaddleSentRef.current = s.myPaddleY;
+
+              channel.send({
+                type: 'broadcast',
+                event: 'p2_state',
+                payload: { paddleY: s.myPaddleY },
+              });
+            }
           }
         }
       }
 
-      draw(ctx, s, isHost, renderOpponentPaddleY);
+      draw(ctx, s, isHost, renderOpponentPaddleY, ballSpriteRef.current, paddleSpriteRef.current);
+
+      if (scoreRef.current) scoreRef.current.textContent = `${s.score.p1} — ${s.score.p2}`;
+      if (statusOverlayRef.current) {
+        let msg = '';
+        if (!s.bothConnected) msg = 'WAITING FOR OPPONENT…';
+        else if (s.serving && !s.gameOver) msg = 'GET READY…';
+        statusOverlayRef.current.textContent = msg;
+      }
+
       rafRef.current = requestAnimationFrame(loop);
     };
 
     rafRef.current = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(rafRef.current);
   }, [isHost]);
-
 
   function handleRestart() {
     if (isHost) {
@@ -396,11 +441,9 @@ export default function App() {
         Room: <strong>{roomCode}</strong> — you are{' '}
         <strong>{isHost ? 'Player 1' : 'Player 2'}</strong> — {status}
       </p>
-      {status === 'waiting' && isHost && (
-        <p>Share this link: {window.location.href}</p>
-      )}
+      {status === 'waiting' && isHost && <p>Share this link: {window.location.href}</p>}
 
-      <div style={{ position: 'relative', display: 'inline-block' }}>
+      <div style={{ position: 'relative', display: 'inline-block', fontFamily: "'Orbitron', sans-serif" }}>
         <canvas
           ref={canvasRef}
           width={CANVAS_WIDTH}
@@ -408,41 +451,49 @@ export default function App() {
           style={{ background: '#000', border: '1px solid #444' }}
         />
 
+        <div
+          ref={scoreRef}
+          style={{
+            position: 'absolute', top: 16, left: '50%', transform: 'translateX(-50%)',
+            fontSize: '32px', fontWeight: 700, color: '#0ff',
+            textShadow: '0 0 10px #0ff, 0 0 20px rgba(0,255,255,0.6)',
+            letterSpacing: '4px', pointerEvents: 'none',
+          }}
+        >
+          0 — 0
+        </div>
+
+        <div
+          ref={statusOverlayRef}
+          style={{
+            position: 'absolute', top: '45%', left: '50%', transform: 'translateX(-50%)',
+            fontSize: '18px', letterSpacing: '2px', color: '#888', pointerEvents: 'none',
+          }}
+        />
+
         {winner && (
           <div
             style={{
-              position: 'absolute',
-              top: 0,
-              left: 0,
-              width: '100%',
-              height: '100%',
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'center',
-              justifyContent: 'center',
-              background: 'rgba(0, 0, 0, 0.75)',
-              gap: '16px',
+              position: 'absolute', top: 0, left: 0, width: '100%', height: '100%',
+              display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+              background: 'rgba(0, 0, 0, 0.75)', gap: '16px', fontFamily: "'Orbitron', sans-serif",
             }}
           >
-            <h2 style={{ margin: 0, fontSize: '32px' }}>
-              {youWon ? 'You Win! 🎉' : 'You Lose'}
+            <h2 style={{ margin: 0, fontSize: '32px', color: '#0ff', textShadow: '0 0 12px #0ff' }}>
+              {youWon ? 'YOU WIN! 🎉' : 'YOU LOSE'}
             </h2>
-            <p style={{ margin: 0, opacity: 0.8 }}>
-              {winner === 'p1' ? 'Player 1' : 'Player 2'} reached {WIN_SCORE} points
+            <p style={{ margin: 0, opacity: 0.8, letterSpacing: '1px' }}>
+              {winner === 'p1' ? 'PLAYER 1' : 'PLAYER 2'} REACHED {WIN_SCORE} POINTS
             </p>
             <button
               onClick={handleRestart}
               style={{
-                padding: '10px 24px',
-                fontSize: '16px',
-                cursor: 'pointer',
-                background: '#fff',
-                color: '#000',
-                border: 'none',
-                borderRadius: '6px',
+                padding: '10px 24px', fontSize: '16px', fontFamily: "'Orbitron', sans-serif",
+                cursor: 'pointer', background: '#0ff', color: '#000', border: 'none',
+                borderRadius: '6px', fontWeight: 700,
               }}
             >
-              Restart Game
+              RESTART
             </button>
           </div>
         )}
