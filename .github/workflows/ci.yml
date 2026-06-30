@@ -1,11 +1,11 @@
 name: CI
 
-# Runs whenever you push to a feature branch, and again on the PR itself
+# Runs whenever you push to a fix branch, and again on the PR itself
 # once you open it against staging — that second run is the one that gates the merge.
 on:
   push:
     branches:
-      - 'feature/**'
+      - 'fix/**'
   pull_request:
     branches:
       - staging
