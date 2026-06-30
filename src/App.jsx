@@ -133,7 +133,9 @@ function makeInitialState() {
       ball: {
         target: { x: CANVAS_WIDTH / 2, y: CANVAS_HEIGHT / 2, vx: 0, vy: 0 },
         receivedAt: 0,
-        frozen: false,
+        // Start frozen so P2 never extrapolates a stale pre-game ball state
+        // before the first real broadcast with serving:true arrives.
+        frozen: true,
       },
     },
   };
@@ -512,19 +514,24 @@ export default function App() {
         const channel = channelRef.current;
         if (channel && channelReadyRef.current) {
           if (isHost) {
-            channel.send({
-              type:  'broadcast',
-              event: 'p1_state',
-              payload: {
-                paddleY:    s.myPaddleY,
-                ball:       s.ball,
-                // ballFrozen=true freezes P2's extrapolation during pendingMiss
-                ballFrozen: s.serving || !!s.pendingMiss,
-                score:      s.score,
-                serving:    s.serving,
-                gameOver:   s.gameOver,
-              },
-            });
+            // Only broadcast once both players are connected.
+            // The host's initial ball state (vx ≠ 0) must NOT reach P2 before
+            // the serve countdown, otherwise P2 extrapolates the ball mid-air.
+            if (s.bothConnected) {
+              channel.send({
+                type:  'broadcast',
+                event: 'p1_state',
+                payload: {
+                  paddleY:    s.myPaddleY,
+                  ball:       s.ball,
+                  // ballFrozen=true freezes P2's extrapolation during serve / pendingMiss
+                  ballFrozen: s.serving || !!s.pendingMiss,
+                  score:      s.score,
+                  serving:    s.serving,
+                  gameOver:   s.gameOver,
+                },
+              });
+            }
           } else {
             // P2 always sends when position changed — host needs fresh data
             // so pendingMiss can resolve correctly.
